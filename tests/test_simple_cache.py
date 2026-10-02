@@ -7,6 +7,7 @@ from common import CommonTests
 from has import HasTests
 from serializer import SerializerTests
 
+from cachelib import BorrowHandle
 from cachelib import SimpleCache
 from cachelib.serializers import BaseSerializer
 
@@ -244,3 +245,186 @@ class TestSimpleCache(CommonTests, HasTests, ClearTests, SerializerTests):
         assert len(cache._cache) == 1
         assert cache.has("shared") is True
         assert cache.get("shared") in written_values
+
+    def test_borrow_delays_cleanup_until_final_release(self):
+        cleaned = []
+        cache = self.cache_factory(value_cleanup=cleaned.append)
+        old_value = object()
+        new_value = "new-value"
+        cache.set("key", old_value, timeout=1)
+
+        first_borrow = cache.borrow("key")
+        second_borrow = cache.borrow("key")
+        assert first_borrow is not None
+        assert second_borrow is not None
+        assert first_borrow.value is old_value
+        assert second_borrow.value is old_value
+
+        sleep(1.1)
+        assert cache.borrow("key") is None
+        assert cache.get("key") is None
+        assert cache.has("key") is False
+        assert cache.set("key", new_value, timeout=0) is True
+        assert cache.get("key") == new_value
+        assert cleaned == []
+
+        first_borrow.release()
+        assert cleaned == []
+        first_borrow.release()
+        assert cleaned == []
+
+        second_borrow.release()
+        assert cleaned == [old_value]
+        second_borrow.release()
+        assert cleaned == [old_value]
+
+        cache.delete("key")
+        assert cleaned == [old_value, new_value]
+
+    def test_borrow_handle_is_context_manager_and_supports_close(self):
+        cleaned = []
+        cache = self.cache_factory(value_cleanup=cleaned.append)
+        value = object()
+        cache.set("key", value)
+
+        with cache.borrow("key") as handle:
+            assert isinstance(handle, BorrowHandle)
+            assert handle.value is value
+        assert cleaned == []
+
+        handle = cache.borrow("key")
+        assert handle is not None
+        cache.delete("key")
+        handle.close()
+        assert cleaned == [value]
+
+    def test_rewrite_keeps_independent_borrow_counts(self):
+        cleaned = []
+        cache = self.cache_factory(threshold=2, value_cleanup=cleaned.append)
+        old_value = object()
+        new_value = object()
+        cache.set("key", old_value)
+        old_borrow = cache.borrow("key")
+        assert old_borrow is not None
+
+        assert cache.set("key", new_value) is True
+        extra_new_borrow = cache.borrow("key")
+        assert extra_new_borrow is not None
+        new_borrow = cache.borrow("key")
+        assert new_borrow is not None
+        assert new_borrow.value is new_value
+
+        extra_new_borrow.release()
+        new_borrow.release()
+        assert cleaned == []
+        old_borrow.release()
+        assert cleaned == [old_value]
+
+        cache.delete("key")
+        assert cleaned == [old_value, new_value]
+
+    def test_borrowed_capacity_rejects_new_values(self):
+        cleaned = []
+        cache = self.cache_factory(threshold=1, value_cleanup=cleaned.append)
+        value = object()
+        cache.set("key", value, timeout=1)
+        borrow = cache.borrow("key")
+        assert borrow is not None
+
+        assert cache.set("other", object()) is False
+        assert cache.add("other", object()) is False
+        assert cache.has("other") is False
+        assert cleaned == []
+
+        sleep(1.1)
+        assert cache.set("other", object(), timeout=0) is False
+        borrow.release()
+        assert cleaned == [value]
+
+    def test_expired_entry_seen_by_get_is_cleaned_once(self):
+        cleaned = []
+        cache = self.cache_factory(value_cleanup=cleaned.append)
+        value = object()
+        cache.set("key", value, timeout=1)
+
+        sleep(1.1)
+        assert cache.get("key") is None
+        assert cleaned == [value]
+        assert cache.get("key") is None
+        assert cache.has("key") is False
+        assert cleaned == [value]
+
+    def test_clear_retires_borrowed_versions_and_cleans_unborrowed_once(self):
+        cleaned = []
+        cache = self.cache_factory(value_cleanup=cleaned.append)
+        borrowed_value = object()
+        unborrowed_value = object()
+        cache.set("borrowed", borrowed_value)
+        cache.set("unborrowed", unborrowed_value)
+        borrow = cache.borrow("borrowed")
+        assert borrow is not None
+
+        assert cache.clear() is True
+        assert cleaned == [unborrowed_value]
+        assert cache.get("borrowed") is None
+
+        borrow.release()
+        assert cleaned == [unborrowed_value, borrowed_value]
+        borrow.release()
+        assert cleaned == [unborrowed_value, borrowed_value]
+
+    def test_cleanup_errors_are_collected_without_losing_other_values(self):
+        first = object()
+        second = object()
+        third = object()
+        cleaned = []
+
+        def cleanup(value):
+            cleaned.append(value)
+            if value is second:
+                raise RuntimeError("second cleanup failed")
+
+        cache = self.cache_factory(value_cleanup=cleanup)
+        cache.set("first", first)
+        cache.set("second", second)
+        cache.set("third", third)
+
+        with pytest.raises(ExceptionGroup) as exc_info:
+            cache.clear()
+        assert len(exc_info.value.exceptions) == 1
+        assert str(exc_info.value.exceptions[0]) == "second cleanup failed"
+        assert cleaned == [first, second, third]
+
+        borrow = cache.borrow("first")
+        assert borrow is None
+        assert cache.clear() is True
+        assert cleaned == [first, second, third]
+
+    def test_failed_borrow_cleanup_is_not_retried(self):
+        calls = []
+
+        def cleanup(value):
+            calls.append(value)
+            raise RuntimeError("cleanup failed")
+
+        cache = self.cache_factory(value_cleanup=cleanup)
+        value = object()
+        cache.set("key", value)
+        handle = cache.borrow("key")
+        assert handle is not None
+        cache.delete("key")
+
+        with pytest.raises(ExceptionGroup, match="cleanup failed"):
+            handle.release()
+        assert calls == [value]
+
+        handle.release()
+        assert calls == [value]
+
+    def test_cleanup_keyword_aliases_value_cleanup(self):
+        cleaned = []
+        cache = self.cache_factory(cleanup=cleaned.append)
+        value = object()
+        cache.set("key", value)
+        cache.delete("key")
+        assert cleaned == [value]
