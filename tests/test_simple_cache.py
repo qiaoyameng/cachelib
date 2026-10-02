@@ -31,6 +31,15 @@ class CustomCache(SimpleCache):
         super().__init__(*args, **kwargs)
 
 
+class Resource:
+    def __init__(self, name):
+        self.name = name
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
 @pytest.fixture(autouse=True, params=[SimpleCache, CustomCache])
 def cache_factory(request):
     def _factory(self, *args, **kwargs):
@@ -244,3 +253,180 @@ class TestSimpleCache(CommonTests, HasTests, ClearTests, SerializerTests):
         assert len(cache._cache) == 1
         assert cache.has("shared") is True
         assert cache.get("shared") in written_values
+
+    def test_borrow_delays_cleanup_until_expired_version_is_released(self):
+        cleaned = []
+        cache = self.cache_factory(
+            threshold=2, value_cleanup=lambda value: cleaned.append(value)
+        )
+        old = Resource("old")
+        new = Resource("new")
+
+        handle = cache.borrow("key")
+        assert handle is None
+
+        cache.set("key", old, timeout=1)
+        handle = cache.borrow("key")
+        assert handle is not None
+        assert handle.value is old
+        sleep(2)
+
+        assert cache.has("key") is False
+        assert cache.get("key") is None
+        assert cache.set("key", new) is True
+        other_new_handle = cache.borrow("key")
+        assert other_new_handle is not None
+        new_handle = cache.borrow("key")
+        assert new_handle is not None
+        assert new_handle.value is new
+        assert cleaned == []
+
+        handle.release()
+        handle.release()
+        assert cleaned == [old]
+
+        new_handle.release()
+        assert cleaned == [old]
+        assert other_new_handle.value is new
+
+        cache.delete("key")
+        other_new_handle.release()
+        assert cleaned == [old, new]
+
+    def test_borrowed_versions_have_independent_counts(self):
+        cleaned = []
+        cache = self.cache_factory(
+            threshold=3, value_cleanup=lambda value: cleaned.append(value)
+        )
+        first = Resource("first")
+        second = Resource("second")
+
+        cache.set("key", first)
+        first_handle = cache.borrow("key")
+        assert first_handle is not None
+        assert cache.set("key", second) is True
+        second_handle = cache.borrow("key")
+        assert second_handle is not None
+
+        first_handle.release()
+        assert cleaned == [first]
+        cache.delete("key")
+        second_handle.release()
+        assert cleaned == [first, second]
+
+    def test_borrowed_version_rejects_new_write_when_capacity_is_full(self):
+        cleaned = []
+        cache = self.cache_factory(
+            threshold=1, value_cleanup=lambda value: cleaned.append(value)
+        )
+        old = Resource("old")
+        new = Resource("new")
+
+        cache.set("key", old)
+        handle = cache.borrow("key")
+        assert handle is not None
+        assert cache.set("key", new) is False
+        assert cache.has("key") is True
+
+        other = Resource("other")
+        assert cache.set("other", other) is False
+        assert "other" not in cache._cache
+
+        handle.release()
+        assert cleaned == []
+        assert cache.set("key", new) is True
+        assert cleaned == [old]
+        new_handle = cache.borrow("key")
+        assert new_handle is not None
+        assert new_handle.value is new
+
+    def test_cleanup_error_does_not_clean_twice_or_skip_other_version(self):
+        def cleanup(value):
+            cleaned.append(value)
+            if value is old:
+                raise RuntimeError("boom")
+
+        cleaned = []
+        cache = self.cache_factory(threshold=2, value_cleanup=cleanup)
+        old = Resource("old")
+        new = Resource("new")
+
+        old_handle = cache.borrow("missing")
+        assert old_handle is None
+        cache.set("key", old)
+        old_handle = cache.borrow("key")
+        assert old_handle is not None
+        cache.delete("key")
+        cache.set("key", new)
+        new_handle = cache.borrow("key")
+        assert new_handle is not None
+
+        with pytest.raises(RuntimeError, match="boom"):
+            old_handle.release()
+        old_handle.release()
+        assert cleaned == [old]
+
+        cache.clear()
+        assert cleaned == [old]
+        new_handle.release()
+        assert cleaned == [old, new]
+        cache.clear()
+        assert cleaned == [old, new]
+
+    def test_clear_cleans_each_borrowed_version_once(self):
+        cleaned = []
+        cache = self.cache_factory(
+            threshold=2, value_cleanup=lambda value: cleaned.append(value)
+        )
+        old = Resource("old")
+        new = Resource("new")
+
+        cache.set("key", old)
+        old_handle = cache.borrow("key")
+        assert old_handle is not None
+        cache.set("key", new)
+        new_handle = cache.borrow("key")
+        assert new_handle is not None
+
+        assert cache.clear() is True
+        assert cache.get("key") is None
+        assert cleaned == []
+
+        old_handle.release()
+        new_handle.release()
+        old_handle.release()
+        new_handle.release()
+        assert cleaned == [old, new]
+
+    def test_borrow_handle_supports_context_manager(self):
+        cleaned = []
+        cache = self.cache_factory(
+            value_cleanup=lambda value: cleaned.append(value)
+        )
+        value = Resource("context")
+
+        cache.set("key", value)
+        with cache.borrow("key") as handle:
+            assert handle.value is value
+            cache.delete("key")
+            assert cleaned == []
+        assert cleaned == [value]
+
+    def test_borrow_preserves_original_external_resource(self):
+        resource = Resource("external")
+        cache = self.cache_factory(threshold=2, value_cleanup=Resource.close)
+
+        cache.set("resource", resource)
+        handle = cache.borrow("resource")
+        assert handle is not None
+        assert handle.value is resource
+        cache.delete("resource")
+        assert resource.closed is False
+
+        replacement = Resource("replacement")
+        assert cache.set("resource", replacement) is True
+        cache.delete("resource")
+        handle.release()
+        handle.release()
+        assert resource.closed is True
+        assert replacement.closed is True

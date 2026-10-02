@@ -5,6 +5,8 @@ from cachelib.file import FileSystemCache
 from cachelib.memcached import MemcachedCache
 from cachelib.mongodb import MongoDbCache
 from cachelib.redis import RedisCache
+from cachelib.simple import BorrowHandle
+from cachelib.simple import BorrowedValue
 from cachelib.simple import SimpleCache
 from cachelib.uwsgi import UWSGICache
 from cachelib.valkey import ValkeyCache
@@ -12,6 +14,8 @@ from cachelib.valkey import ValkeyCache
 __all__ = [
     "BaseCache",
     "NullCache",
+    "BorrowHandle",
+    "BorrowedValue",
     "SimpleCache",
     "FileSystemCache",
     "MemcachedCache",
