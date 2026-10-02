@@ -1,3 +1,10 @@
+Unreleased
+----------
+
+- Add ``AuthenticatedSerializer`` to wrap serializer values with HMAC-SHA256
+  authentication, including explicit key rotation, payload size limits, and
+  rejection of unauthenticated or malformed cached values.
+
 Version 0.17.0
 --------------
 

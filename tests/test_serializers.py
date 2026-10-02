@@ -1,10 +1,16 @@
+import hmac
 import io
+import logging
 import pickle
+import struct
+from hashlib import sha256
 
 import pytest
 
+from cachelib.serializers import AuthenticatedSerializer
 from cachelib.serializers import BaseRedisSerializer
 from cachelib.serializers import BaseSerializer
+from cachelib.serializers import HMACSerializer
 from cachelib.serializers import JSONSerializer
 from cachelib.serializers import RedisSerializer
 from cachelib.serializers import ValkeySerializer
@@ -35,6 +41,23 @@ class _Unpicklable:
 
     def __reduce__(self):
         raise pickle.PicklingError("cannot pickle")
+
+
+class CountingSerializer(BaseSerializer):
+    def __init__(self):
+        self.loads_count = 0
+        self.load_count = 0
+
+    def dumps(self, value, protocol=pickle.HIGHEST_PROTOCOL):
+        return pickle.dumps(value, protocol)
+
+    def loads(self, bvalue):
+        self.loads_count += 1
+        return pickle.loads(bvalue)
+
+    def load(self, f):
+        self.load_count += 1
+        return pickle.load(f)
 
 
 class TestBaseSerializer:
@@ -142,3 +165,201 @@ class TestJSONSerializer:
 
     def test_load_invalid_stream_returns_none(self):
         assert self.s.load(io.BytesIO(b"not valid json {{{{")) is None
+
+
+class TestAuthenticatedSerializer:
+    current_secret = b"current-secret"
+    old_secret = b"old-secret"
+
+    def make(self, inner=None, **kwargs):
+        return AuthenticatedSerializer(
+            inner or CountingSerializer(),
+            self.current_secret,
+            key_id=b"new",
+            old_keys={b"old": self.old_secret},
+            **kwargs,
+        )
+
+    def envelope(self, serializer, value, key_id, secret, version=1):
+        payload = pickle.dumps(value)
+        header = struct.pack(">BBI", version, len(key_id), len(payload))
+        signed_data = header + key_id + payload
+        return signed_data + hmac.new(secret, signed_data, sha256).digest()
+
+    def test_roundtrip_uses_current_key(self):
+        inner = CountingSerializer()
+        serializer = self.make(inner)
+
+        assert serializer.loads(serializer.dumps({"ok": True})) == {"ok": True}
+        assert inner.loads_count == 1
+
+    def test_stream_roundtrip_uses_current_key(self):
+        inner = CountingSerializer()
+        serializer = self.make(inner)
+        buf = io.BytesIO()
+        serializer.dump({"ok": True}, buf)
+        buf.seek(0)
+
+        assert serializer.load(buf) == {"ok": True}
+        assert inner.load_count == 1
+
+    def test_stream_roundtrip_with_json_serializer(self):
+        serializer = AuthenticatedSerializer(
+            JSONSerializer(), self.current_secret
+        )
+        buf = io.BytesIO()
+        serializer.dump({"ok": True}, buf)
+        buf.seek(0)
+
+        assert serializer.load(buf) == {"ok": True}
+
+    def test_bytes_roundtrip_with_json_serializer(self):
+        serializer = AuthenticatedSerializer(
+            JSONSerializer(), self.current_secret
+        )
+
+        assert serializer.loads(serializer.dumps({"ok": True})) == {"ok": True}
+
+    @pytest.mark.parametrize(
+        "tamper",
+        [
+            lambda value: value[:0] + bytes([value[0] ^ 1]) + value[1:],
+            lambda value: value[:9] + bytes([value[9] ^ 1]) + value[10:],
+            lambda value: value[:-1] + bytes([value[-1] ^ 1]),
+        ],
+        ids=["header", "payload", "signature"],
+    )
+    def test_tampered_values_do_not_reach_inner_serializer(self, tamper, caplog):
+        inner = CountingSerializer()
+        serializer = self.make(inner)
+        value = serializer.dumps({"ok": True})
+
+        caplog.set_level(logging.WARNING)
+        assert serializer.loads(tamper(value)) is None
+        assert inner.loads_count == 0
+        assert self.current_secret not in caplog.text.encode()
+        assert self.old_secret not in caplog.text.encode()
+
+    def test_tampered_stream_values_do_not_reach_inner_serializer(self):
+        inner = CountingSerializer()
+        serializer = self.make(inner)
+        value = serializer.dumps({"ok": True})
+        tampered = value[:-1] + bytes([value[-1] ^ 1])
+
+        assert serializer.load(io.BytesIO(tampered)) is None
+        assert inner.load_count == 0
+
+    def test_old_key_loads_when_explicitly_configured(self):
+        inner = CountingSerializer()
+        serializer = self.make(inner)
+        value = self.envelope(
+            serializer, {"rotated": True}, b"old", self.old_secret
+        )
+
+        assert serializer.loads(value) == {"rotated": True}
+        assert inner.loads_count == 1
+
+    def test_old_key_is_not_used_for_new_values(self):
+        serializer = self.make()
+        value = serializer.dumps({"ok": True})
+
+        assert value[6:9] == b"new"
+
+    def test_old_key_rejected_without_configuration(self):
+        inner = CountingSerializer()
+        serializer = AuthenticatedSerializer(
+            inner, self.current_secret, key_id=b"new"
+        )
+        value = self.envelope(
+            serializer, {"rotated": True}, b"old", self.old_secret
+        )
+
+        assert serializer.loads(value) is None
+        assert inner.loads_count == 0
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            b"",
+            b"\x01",
+            pickle.dumps({"bare": True}),
+        ],
+        ids=["empty", "truncated", "bare-payload"],
+    )
+    def test_invalid_values_are_rejected_without_fallback(self, value):
+        inner = CountingSerializer()
+        serializer = self.make(inner)
+
+        assert serializer.loads(value) is None
+        assert inner.loads_count == 0
+
+    def test_unknown_version_is_rejected(self):
+        inner = CountingSerializer()
+        serializer = self.make(inner)
+        value = self.envelope(
+            serializer, {"ok": True}, b"new", self.current_secret, version=2
+        )
+
+        assert serializer.loads(value) is None
+        assert inner.loads_count == 0
+
+    def test_empty_payload_is_rejected(self):
+        inner = CountingSerializer()
+        serializer = self.make(inner)
+        key_id = b"new"
+        header = struct.pack(">BBI", 1, len(key_id), 0)
+        signed_data = header + key_id
+        value = signed_data + self._signature_for_test(signed_data)
+
+        assert serializer.loads(value) is None
+        assert inner.loads_count == 0
+
+    def _signature_for_test(self, signed_data):
+        return hmac.new(self.current_secret, signed_data, sha256).digest()
+
+    def test_truncated_stream_is_rejected(self):
+        inner = CountingSerializer()
+        serializer = self.make(inner)
+        value = serializer.dumps({"ok": True})
+
+        assert serializer.load(io.BytesIO(value[:-1])) is None
+        assert inner.load_count == 0
+
+    def test_unknown_key_id_is_rejected(self):
+        inner = CountingSerializer()
+        serializer = self.make(inner)
+        value = self.envelope(
+            serializer, {"ok": True}, b"bad", self.current_secret
+        )
+
+        assert serializer.loads(value) is None
+        assert inner.loads_count == 0
+
+    def test_payload_size_limit_is_enforced_before_loads(self):
+        inner = CountingSerializer()
+        serializer = self.make(inner, max_payload_size=4)
+
+        assert serializer.dumps("12345") is None
+        assert inner.loads_count == 0
+
+    def test_from_keys_accepts_configured_old_key(self):
+        inner = CountingSerializer()
+        serializer = HMACSerializer.from_keys(
+            inner,
+            {b"new": self.current_secret, b"old": self.old_secret},
+            b"new",
+        )
+        value = self.envelope(
+            serializer, {"rotated": True}, b"old", self.old_secret
+        )
+
+        assert serializer.loads(value) == {"rotated": True}
+        assert inner.loads_count == 1
+
+    def test_from_keys_rejects_duplicate_normalized_key_id(self):
+        with pytest.raises(ValueError, match="duplicate key id"):
+            AuthenticatedSerializer.from_keys(
+                CountingSerializer(),
+                {b"new": self.current_secret, "new": b"other-secret"},
+                b"new",
+            )
