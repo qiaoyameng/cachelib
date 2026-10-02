@@ -212,3 +212,127 @@ class TestFileSystemCache(CommonTests, ClearTests, HasTests, SerializerTests):
         cache.set("expiring", "value", timeout=1)
         sleep(2)
         assert cache.has("expiring") is False
+
+    def test_max_bytes_accounting(self, tmpdir):
+        """Interleaved writes of different sizes and an injected replace
+        failure: on-disk totals, readable content and the cache reported
+        usage must all agree."""
+        max_bytes = 4096
+        cache = FileSystemCache(str(tmpdir), threshold=0, max_bytes=max_bytes)
+
+        def disk_usage():
+            return sum(os.path.getsize(f) for f in cache._list_dir())
+
+        def leftover_tmp_files():
+            return [
+                f
+                for f in os.listdir(str(tmpdir))
+                if f.endswith(cache._fs_transaction_suffix)
+            ]
+
+        # interleave small and large values
+        assert cache.set("small-1", "s" * 32)
+        assert cache.set("large-1", "L" * 1024)
+        assert cache.set("small-2", "s" * 32)
+        assert cache.set("large-2", "L" * 1024)
+        assert cache._file_bytes > 0
+        assert cache._file_bytes == disk_usage()
+
+        # replacing a key refunds the old version before charging the new
+        old_size = os.path.getsize(cache._get_filename("large-1"))
+        before = cache._file_bytes
+        assert cache.set("large-1", "L" * 256)
+        new_size = os.path.getsize(cache._get_filename("large-1"))
+        assert cache._file_bytes == before - old_size + new_size
+        assert cache._file_bytes == disk_usage()
+
+        # inject a replace failure: the old value survives, the
+        # uncommitted temp file is removed and the counters don't move
+        with patch("cachelib.file.os.replace", side_effect=OSError("boom")):
+            assert not cache.set("large-2", "X" * 2048)
+        assert cache.get("large-2") == "L" * 1024
+        assert cache._file_bytes == disk_usage()
+        assert not leftover_tmp_files()
+
+        # every stored value is still readable
+        assert cache.get("small-1") == "s" * 32
+        assert cache.get("small-2") == "s" * 32
+        assert cache.get("large-1") == "L" * 256
+
+        # forcing the budget evicts older entries; reported usage, disk
+        # usage and readable content stay consistent
+        assert cache.set("huge", "H" * 3000)
+        assert cache._file_bytes <= max_bytes
+        assert cache._file_bytes == disk_usage()
+        assert cache.get("huge") == "H" * 3000
+        assert not leftover_tmp_files()
+
+    def test_max_bytes_rejects_oversized_entry(self, tmpdir):
+        """A single entry larger than the budget is rejected before the
+        previous value is destroyed."""
+        cache = FileSystemCache(str(tmpdir), threshold=0, max_bytes=1024)
+        assert cache.set("key", "small value")
+        before = cache._file_bytes
+        assert not cache.set("key", "x" * 4096)
+        assert cache.get("key") == "small value"
+        assert cache._file_bytes == before
+        # a fresh oversized key is rejected as well
+        assert not cache.set("other", "x" * 4096)
+        assert cache.get("other") is None
+
+    def test_max_bytes_eviction_order(self, tmpdir):
+        """Expired entries are freed first, then the entries with the
+        oldest expiration timestamp."""
+        path = str(tmpdir)
+        setup = FileSystemCache(path, threshold=0)
+        assert setup.set("expired", "e" * 700, timeout=1)
+        assert setup.set("oldest", "o" * 700, timeout=100)
+        assert setup.set("newest", "n" * 700, timeout=200)
+        sleep(2)
+        entry_size = os.path.getsize(setup._get_filename("newest"))
+        # room for exactly two entries once the budget applies
+        cache = FileSystemCache(path, threshold=0, max_bytes=2 * entry_size + 8)
+        assert cache._file_bytes == 3 * entry_size
+        assert cache.set("trigger", "t" * 700, timeout=300)
+        # the expired entry was freed first, then the oldest expiry
+        assert not os.path.exists(cache._get_filename("expired"))
+        assert not os.path.exists(cache._get_filename("oldest"))
+        assert cache.get("newest") == "n" * 700
+        assert cache.get("trigger") == "t" * 700
+        assert cache._file_bytes <= cache._max_bytes
+        assert cache._file_bytes == sum(os.path.getsize(f) for f in cache._list_dir())
+
+    def test_max_bytes_and_threshold_together(self, tmpdir):
+        """The entry count and the byte budget are enforced together and
+        the stored counters always match the real files on disk."""
+        cache = FileSystemCache(str(tmpdir), threshold=100, max_bytes=1024)
+        for i in range(8):
+            assert cache.set(f"key-{i}", "v" * 256, timeout=100 + i)
+        assert cache._file_count <= 100
+        assert cache._file_bytes <= 1024
+        assert cache._file_count == len(list(cache._list_dir()))
+        assert cache._file_bytes == sum(os.path.getsize(f) for f in cache._list_dir())
+
+    def test_serialization_failure_keeps_accounting(self, tmpdir):
+        """A serializer failure must not leak temp files or skew the
+        stored counters."""
+
+        class ExplodingSerializer(BaseSerializer):
+            def dump(self, value, fs):
+                raise ValueError("cannot serialize")
+
+        cache = FileSystemCache(str(tmpdir), threshold=10, max_bytes=4096)
+        assert cache.set("good", "g" * 100)
+        count_before = cache._file_count
+        bytes_before = cache._file_bytes
+        cache.serializer = ExplodingSerializer()
+        with pytest.raises(ValueError, match="cannot serialize"):
+            cache.set("bad", "b" * 100)
+        assert cache._file_count == count_before
+        assert cache._file_bytes == bytes_before
+        assert not [
+            f
+            for f in os.listdir(str(tmpdir))
+            if f.endswith(cache._fs_transaction_suffix)
+        ]
+        assert cache.get("good") == "g" * 100

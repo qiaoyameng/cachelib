@@ -1,3 +1,15 @@
+Version 0.18.0
+--------------
+
+Unreleased
+
+- Add ``max_bytes`` parameter to ``FileSystemCache`` to limit the total
+  on-disk size of cache entries. It is enforced together with
+  ``threshold``: expired entries are evicted first, then the entries with
+  the oldest expiration timestamp. A single entry larger than the budget
+  is rejected without destroying the previously stored value.
+
+
 Version 0.17.0
 --------------
 
