@@ -1,5 +1,6 @@
 import hashlib
 import os
+from time import time
 from time import sleep
 from unittest.mock import Mock
 from unittest.mock import patch
@@ -44,6 +45,15 @@ class CustomSerializerCache(FileSystemCache):
 class CustomHashingMethodCache(FileSystemCache):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, hash_method=hashlib.sha256, **kwargs)
+
+
+def constant_hash(data=b""):
+    """A hash method that maps every key to the same digest, forcing
+    all keys to collide on a single cache address. The cache management
+    key keeps a distinct address, as it would with a real hash."""
+    if data == FileSystemCache._fs_count_file.encode("utf-8"):
+        return hashlib.sha256(data)
+    return hashlib.sha256(b"constant-collision")
 
 
 @pytest.fixture(
@@ -212,3 +222,106 @@ class TestFileSystemCache(CommonTests, ClearTests, HasTests, SerializerTests):
         cache.set("expiring", "value", timeout=1)
         sleep(2)
         assert cache.has("expiring") is False
+
+    def test_collision_safe_interleaved_operations(self, tmpdir):
+        """Three keys sharing one hash digest stay fully isolated across
+        interleaved add/set/get/has/delete operations."""
+        cache = FileSystemCache(
+            tmpdir, hash_method=constant_hash, collision_safe=True
+        )
+        assert cache.set("alpha", 1)
+        # a different key on the same address must still be addable
+        assert cache.add("beta", 2) is True
+        # but an existing key must not be re-added
+        assert cache.add("beta", 99) is False
+        assert cache.set("gamma", 3)
+        assert cache.get("alpha") == 1
+        assert cache.get("beta") == 2
+        assert cache.get("gamma") == 3
+        assert cache.has("alpha")
+        assert cache.has("beta")
+        assert cache.has("gamma")
+        assert cache._file_count == 3
+        # overwriting one key leaves the others untouched
+        assert cache.set("alpha", 11)
+        assert cache.get("alpha") == 11
+        assert cache.get("beta") == 2
+        assert cache._file_count == 3
+        # deleting one key leaves the others untouched
+        assert cache.delete("beta") is True
+        assert cache.get("beta") is None
+        assert cache.has("beta") is False
+        assert cache.get("alpha") == 11
+        assert cache.get("gamma") == 3
+        # deleting an absent key is a successful no-op
+        assert cache.delete("beta") is True
+        assert cache.delete("missing") is True
+        assert cache._file_count == 2
+        assert cache.clear()
+        assert cache._file_count == 0
+
+    def test_collision_safe_expiry_counts_records_not_files(self, tmpdir):
+        """Expiry pruning removes individual records from a shared bucket
+        and updates the entry count accordingly."""
+        cache = FileSystemCache(
+            tmpdir, hash_method=constant_hash, collision_safe=True
+        )
+        assert cache.set("expiring", "x", timeout=1)
+        assert cache.set("stable", "y", timeout=0)
+        assert cache._file_count == 2
+        # both records live in a single bucket file
+        assert len(list(cache._list_dir())) == 1
+        sleep(2)
+        cache._remove_expired(time())
+        assert cache.get("expiring") is None
+        assert cache.get("stable") == "y"
+        assert cache._file_count == 1
+
+    def test_collision_safe_prune_over_threshold(self, tmpdir):
+        cache = FileSystemCache(
+            tmpdir, threshold=2, hash_method=constant_hash, collision_safe=True
+        )
+        assert cache.set("k1", "v1", timeout=10)
+        assert cache.set("k2", "v2", timeout=20)
+        assert cache.set("k3", "v3", timeout=30)
+        assert cache._file_count == 3
+        cache._prune()
+        # the record with the earliest expiry is evicted from the bucket
+        assert cache._file_count == 2
+        assert cache.get("k1") is None
+        assert cache.get("k2") == "v2"
+        assert cache.get("k3") == "v3"
+        # the surviving records still share a single bucket file
+        assert len(list(cache._list_dir())) == 1
+
+    def test_collision_safe_write_failure_preserves_records(self, tmpdir):
+        """A failed write leaves the existing bucket records intact."""
+        cache = FileSystemCache(
+            tmpdir, hash_method=constant_hash, collision_safe=True
+        )
+        assert cache.set("alpha", 1)
+        assert cache.set("beta", 2)
+        with patch("cachelib.file.os.replace", side_effect=OSError("boom")):
+            assert cache.set("gamma", 3) is False
+        assert cache.get("alpha") == 1
+        assert cache.get("beta") == 2
+        assert cache.get("gamma") is None
+        assert cache._file_count == 2
+
+    def test_collision_safe_legacy_file_not_adopted(self, tmpdir):
+        """Legacy files lack the original key, so they are never matched,
+        deleted by key, or merged into a bucket."""
+        legacy = FileSystemCache(tmpdir, hash_method=constant_hash)
+        assert legacy.set("ghost", "old")
+        cache = FileSystemCache(
+            tmpdir, hash_method=constant_hash, collision_safe=True
+        )
+        # ownership cannot be verified: no hit, no delete
+        assert cache.get("ghost") is None
+        assert cache.has("ghost") is False
+        assert cache.delete("ghost") is True
+        assert legacy.get("ghost") == "old"
+        # a set to the same address replaces the unmigratable record
+        assert cache.set("real", "new")
+        assert cache.get("real") == "new"
+        assert cache._file_count == 1

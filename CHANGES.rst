@@ -1,3 +1,17 @@
+Version 0.18.0
+--------------
+
+Unreleased
+
+- Add ``collision_safe`` storage mode to ``FileSystemCache``. When enabled,
+  every record stores its full original key and records that hash to the
+  same filename share a single bucket file, so colliding keys never
+  overwrite, false-hit, or delete each other. Entry counting and expiry
+  pruning operate on bucket records instead of file names. Legacy cache
+  files do not contain the original key and are therefore never adopted
+  or guessed; they are replaced on write.
+
+
 Version 0.17.0
 --------------
 
