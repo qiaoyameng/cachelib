@@ -46,12 +46,24 @@ class CustomHashingMethodCache(FileSystemCache):
         super().__init__(*args, hash_method=hashlib.sha256, **kwargs)
 
 
+class CollisionSafeCache(FileSystemCache):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, collision_safe=True, **kwargs)
+
+
+class CollisionSafeCustomSerializerCache(CustomSerializerCache):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, collision_safe=True, **kwargs)
+
+
 @pytest.fixture(
     autouse=True,
     params=[
         FileSystemCache,
         CustomSerializerCache,
         CustomHashingMethodCache,
+        CollisionSafeCache,
+        CollisionSafeCustomSerializerCache,
     ],
 )
 def cache_factory(request, tmpdir):

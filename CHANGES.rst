@@ -1,3 +1,15 @@
+Unreleased
+----------
+
+- Add ``collision_safe`` parameter to ``FileSystemCache``. When enabled,
+  each cache record stores its original key and is verified on every
+  access, so distinct keys that hash to the same filename (e.g. with a
+  weak or short ``hash_method``) stay isolated instead of overwriting,
+  mis-hitting or deleting each other. Legacy format files cannot be
+  migrated (the hash is one-way and the original key is unrecoverable);
+  they are treated as foreign and only removed by ``clear()``.
+
+
 Version 0.17.0
 --------------
 
